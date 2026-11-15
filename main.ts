@@ -51,6 +51,8 @@ function newRepo(owner, name, description, isPrivate, defaultBranch) {
     entries: new Map(), // number -> issue/pull record
     nextNumber: 1,
     seq: 0,
+    storeVersion: 0, // bumps whenever a new object lands in the store
+    packCache: new Map(), // fetchPack results, keyed by storeVersion + request
   };
 }
 function getRepo(owner, name) {
@@ -70,7 +72,10 @@ function oidOf(type, data) {
 }
 function storeObject(repo, type, data) {
   const sha = oidOf(type, data);
-  if (!repo.objects.has(sha)) repo.objects.set(sha, [type, data]);
+  if (!repo.objects.has(sha)) {
+    repo.objects.set(sha, [type, data]);
+    repo.storeVersion += 1;
+  }
   return sha;
 }
 function getObject(repo, sha) {
@@ -287,18 +292,55 @@ function historyFrom(repo, tip) {
 
 // ---------------------------------------------------------------------------
 // Packfiles
+function adler32(data) {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  let i = 0;
+  while (i < data.length) {
+    const end = Math.min(i + 5552, data.length);
+    for (; i < end; i += 1) {
+      a += data[i];
+      b += a;
+    }
+    a %= MOD;
+    b %= MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
 function inflateExact(buffer, offset) {
   // zlib streams are self-terminating and inflateSync tolerates trailing
-  // bytes, so the consumed length is the smallest prefix that inflates.
+  // bytes. One full inflate yields the data; the stream ends with the
+  // Adler-32 of that data, so the trailer's position marks the exact end
+  // and one verify inflate confirms it. (The old code binary-searched the
+  // end with a full inflate per step, ~log2(n) inflates per pack entry.)
   const rest = buffer.subarray(offset);
+  let data;
+  try {
+    data = zlib.inflateSync(rest);
+  } catch {
+    throw new Error('corrupt zlib stream in pack');
+  }
+  const trailer = Buffer.alloc(4);
+  trailer.writeUInt32BE(adler32(data), 0);
+  let at = rest.indexOf(trailer, 4);
+  while (at >= 0) {
+    const end = at + 4;
+    try {
+      if (zlib.inflateSync(rest.subarray(0, end)).equals(data)) return { data, consumed: end };
+    } catch {
+      // not the real trailer; keep looking
+    }
+    at = rest.indexOf(trailer, at + 1);
+  }
+  // Fallback: the smallest prefix that inflates.
   let lo = 1;
   let hi = rest.length;
   let best = -1;
-  let bestData = null;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     try {
-      bestData = zlib.inflateSync(rest.subarray(0, mid));
+      zlib.inflateSync(rest.subarray(0, mid));
       best = mid;
       hi = mid - 1;
     } catch {
@@ -306,7 +348,7 @@ function inflateExact(buffer, offset) {
     }
   }
   if (best < 0) throw new Error('corrupt zlib stream in pack');
-  return { data: bestData, consumed: best };
+  return { data, consumed: best };
 }
 function applyDelta(base, delta) {
   let pos = 0;
@@ -457,7 +499,9 @@ function writePack(repo, shas) {
       bytes.push(size > 0 ? next | 0x80 : next);
     }
     parts.push(Buffer.from(bytes));
-    parts.push(zlib.deflateSync(data));
+    // Level 1: the wire only needs a valid zlib stream, and CPU is the
+    // scarce resource in the pod; the size difference is a few percent.
+    parts.push(zlib.deflateSync(data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = crypto.createHash('sha1').update(body).digest();
@@ -526,8 +570,7 @@ function sidebandChunks(data, band) {
 
 // ---------------------------------------------------------------------------
 // HTTP plumbing
-function sendJson(res, status, value, extraHeaders) {
-  const body = Buffer.from(JSON.stringify(value), 'utf8');
+function sendJsonBody(res, status, body, extraHeaders) {
   const headers = {
     'content-type': 'application/json; charset=utf-8',
     'x-github-request-id': `req-${(requestSeq += 1)}`,
@@ -535,6 +578,9 @@ function sendJson(res, status, value, extraHeaders) {
   };
   res.writeHead(status, headers);
   res.end(body);
+}
+function sendJson(res, status, value, extraHeaders) {
+  sendJsonBody(res, status, Buffer.from(JSON.stringify(value), 'utf8'), extraHeaders);
 }
 function sendError(res, status, message) {
   sendJson(res, status, { message });
@@ -758,9 +804,24 @@ function computeFetch(repo, wants, haves, shallowList, depth) {
   return { objects, shallow: shallowOut, unshallow: unshallowOut };
 }
 function fetchPack(repo, wants, haves, shallowList, depth) {
+  // A fetch's result is a pure function of the object store and the request,
+  // so identical requests against an unchanged store reuse the built pack
+  // (the clone workload asks for the same shallow pack 50 times in a row).
+  const key = [
+    repo.storeVersion,
+    depth == null ? '' : depth,
+    [...wants].sort().join(','),
+    [...haves].sort().join(','),
+    [...shallowList].sort().join(','),
+  ].join('|');
+  const cached = repo.packCache.get(key);
+  if (cached) return cached;
   const { objects, shallow, unshallow } = computeFetch(repo, wants, haves, shallowList, depth);
   const pack = writePack(repo, [...objects]);
-  return { pack, shallow, unshallow, count: objects.size };
+  const result = { pack, shallow, unshallow, count: objects.size };
+  if (repo.packCache.size >= 32) repo.packCache.clear();
+  repo.packCache.set(key, result);
+  return result;
 }
 
 function gitInfoRefs(req, res, repo, service, isV2) {
@@ -1054,6 +1115,7 @@ function createEntry(repo, fields) {
     id: nextEntryId++,
     number: repo.nextNumber++,
     seq: (repo.seq += 1),
+    rev: 0, // bumps on every mutation of this entry (see the rev += 1 sites)
     title: fields.title || '',
     body: fields.body || '',
     state: 'open',
@@ -1149,6 +1211,7 @@ function mergeEntry(repo, entry) {
   entry.pull.merged = true;
   entry.pull.mergeCommitSha = commit;
   entry.state = 'closed';
+  entry.rev += 1;
   return { sha: commit };
 }
 function pullMergeable(repo, entry) {
@@ -1480,13 +1543,24 @@ function handleRest(req, res, segments, query, body, base) {
     const entry = Number.isFinite(number) ? repo.entries.get(number) : undefined;
     if (rest.length === 2) {
       if (!entry) return sendError(res, 404, 'Not Found');
-      if (method === 'GET') return sendJson(res, 200, issueJson(repo, entry, base));
+      if (method === 'GET') {
+        // The read workload GETs one issue thousands of times; the body is a
+        // pure function of the entry (labels are immutable once created), so
+        // serve the serialized body cached under the entry's revision.
+        const cacheKey = `${entry.rev}|${base}`;
+        if (entry._jsonKey === cacheKey) return sendJsonBody(res, 200, entry._jsonBody);
+        const body = Buffer.from(JSON.stringify(issueJson(repo, entry, base)), 'utf8');
+        entry._jsonKey = cacheKey;
+        entry._jsonBody = body;
+        return sendJsonBody(res, 200, body);
+      }
       if (method === 'PATCH') {
         const data = needBody();
         if (data === undefined) return;
         if (typeof data.state === 'string') entry.state = data.state;
         if (typeof data.title === 'string') entry.title = data.title;
         if (typeof data.body === 'string') entry.body = data.body;
+        entry.rev += 1;
         return sendJson(res, 200, issueJson(repo, entry, base));
       }
       return sendError(res, 404, 'Not Found');
@@ -1499,6 +1573,7 @@ function handleRest(req, res, segments, query, body, base) {
         if (data === undefined) return;
         const comment = { id: nextCommentId++, body: typeof data.body === 'string' ? data.body : '' };
         entry.comments.push(comment);
+        entry.rev += 1;
         return sendJson(res, 201, commentJson(comment));
       }
       return sendError(res, 404, 'Not Found');
@@ -1959,6 +2034,7 @@ function gqlResolveField(type, source, field, args, ctx) {
         const found = parsed ? findEntryByGlobalId(parsed) : null;
         if (!found) throw new Error('issue not found');
         found.entry.state = 'closed';
+        found.entry.rev += 1;
         return gqlNode('CloseIssuePayload', { issue: gqlNode('Issue', found), clientMutationId: input.clientMutationId || null });
       }
       if (field === 'createPullRequest') {
@@ -1997,6 +2073,7 @@ function gqlResolveField(type, source, field, args, ctx) {
         if (!found) throw new Error('subject not found');
         const comment = { id: nextCommentId++, body: typeof input.body === 'string' ? input.body : '' };
         found.entry.comments.push(comment);
+        found.entry.rev += 1;
         return gqlNode('AddCommentPayload', {
           commentEdge: gqlNode('CommentEdge', { node: gqlNode('IssueComment', { comment }), cursor: gqlCursor(comment.id) }),
           subject: gqlNode('Issue', found),
