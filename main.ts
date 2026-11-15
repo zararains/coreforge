@@ -53,6 +53,9 @@ function newRepo(owner, name, description, isPrivate, defaultBranch) {
     seq: 0,
     storeVersion: 0, // bumps whenever a new object lands in the store
     packCache: new Map(), // fetchPack results, keyed by storeVersion + request
+    refsVersion: 0, // bumps whenever a ref is created, moved or deleted
+    lsRefsCache: new Map(), // ls-refs reply bytes, keyed by versions + args
+    fetchCache: new Map(), // upload-pack reply bytes, keyed by storeVersion + request
   };
 }
 function getRepo(owner, name) {
@@ -574,8 +577,10 @@ function sendJsonBody(res, status, body, extraHeaders) {
   const headers = {
     'content-type': 'application/json; charset=utf-8',
     'x-github-request-id': `req-${(requestSeq += 1)}`,
-    ...(extraHeaders || {}),
   };
+  if (extraHeaders) {
+    for (const name of Object.keys(extraHeaders)) headers[name] = extraHeaders[name];
+  }
   res.writeHead(status, headers);
   res.end(body);
 }
@@ -589,7 +594,9 @@ function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // Most bodies arrive as one chunk; concatenating a single chunk
+    // would only copy it, so hand it back as it is.
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -645,6 +652,9 @@ function advertiseV2() {
   ];
   return Buffer.concat([pktText('# service=git-upload-pack\n'), PKT_FLUSH, ...lines.map(pktText), PKT_FLUSH]);
 }
+// The v2 capability advertisement is the same bytes for every repository
+// and every request, so build it once and share the buffer.
+const ADVERTISE_V2_BODY = advertiseV2();
 function lsRefs(repo, args) {
   const peel = args.has('peel');
   const symrefs = args.has('symrefs');
@@ -675,6 +685,19 @@ function lsRefs(repo, args) {
     lines.push(`${line}\n`);
   }
   return Buffer.concat([...lines.map(pktText), PKT_FLUSH]);
+}
+// An ls-refs reply is a pure function of the ref map, the object store
+// (tag peeling) and the argument set, so finished bytes are cached per
+// repository under both version counters: a clone asks the identical
+// question right after its capability request, fifty times in a row.
+function lsRefsReply(repo, args) {
+  const key = `${repo.storeVersion}|${repo.refsVersion}|${[...args].sort().join('\n')}`;
+  const hit = repo.lsRefsCache.get(key);
+  if (hit) return hit;
+  const reply = lsRefs(repo, args);
+  if (repo.lsRefsCache.size >= 64) repo.lsRefsCache.clear();
+  repo.lsRefsCache.set(key, reply);
+  return reply;
 }
 // Compute the object set for a fetch. Handles haves (with shallow cut) and
 // depth limiting; returns {objects:Set, shallow:[], unshallow:[]}.
@@ -823,6 +846,26 @@ function fetchPack(repo, wants, haves, shallowList, depth) {
   repo.packCache.set(key, result);
   return result;
 }
+// The whole upload-pack reply (acknowledgments, shallow notes and the
+// packfile section) is a pure function of the object store and the
+// request, so cache the finished bytes per repository: only the first
+// of fifty identical clone fetches pays for framing and concatenation.
+function fetchReply(repo, variant, request, build) {
+  const key = [
+    variant,
+    repo.storeVersion,
+    request.depth == null ? '' : request.depth,
+    [...request.wants].sort().join(','),
+    [...request.haves].sort().join(','),
+    [...request.shallow].sort().join(','),
+  ].join('|');
+  const hit = repo.fetchCache.get(key);
+  if (hit) return hit;
+  const reply = build();
+  if (repo.fetchCache.size >= 64) repo.fetchCache.clear();
+  repo.fetchCache.set(key, reply);
+  return reply;
+}
 
 function gitInfoRefs(req, res, repo, service, isV2) {
   if (!repo) {
@@ -830,7 +873,7 @@ function gitInfoRefs(req, res, repo, service, isV2) {
     res.end('not found');
     return;
   }
-  const body = service === 'git-upload-pack' && isV2 ? advertiseV2() : advertiseV0(repo, service);
+  const body = service === 'git-upload-pack' && isV2 ? ADVERTISE_V2_BODY : advertiseV0(repo, service);
   res.writeHead(200, { 'content-type': `application/x-${service}-advertisement` });
   res.end(body);
 }
@@ -865,37 +908,40 @@ function gitUploadPack(req, res, repo, body) {
     const command = lines.find((line) => line.startsWith('command=')).slice(8);
     if (command === 'ls-refs') {
       const args = new Set(lines.slice(1));
-      const reply = lsRefs(repo, args);
+      const reply = lsRefsReply(repo, args);
       res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result' });
       res.end(reply);
       return;
     }
     if (command === 'fetch') {
       const request = parseFetchArgs(lines.slice(1));
-      const { pack, shallow, unshallow } = fetchPack(repo, request.wants, request.haves, request.shallow, request.depth);
-      const parts = [];
-      if (request.haves.length) {
-        parts.push(pktText('acknowledgments\n'));
-        const common = request.haves.filter((sha) => getObject(repo, sha));
-        if (common.length) {
-          for (const sha of common) parts.push(pktText(`ACK ${sha}\n`));
-          parts.push(pktText('ready\n'));
-        } else {
-          parts.push(pktText('NAK\n'));
+      const reply = fetchReply(repo, 'v2', request, () => {
+        const { pack, shallow, unshallow } = fetchPack(repo, request.wants, request.haves, request.shallow, request.depth);
+        const parts = [];
+        if (request.haves.length) {
+          parts.push(pktText('acknowledgments\n'));
+          const common = request.haves.filter((sha) => getObject(repo, sha));
+          if (common.length) {
+            for (const sha of common) parts.push(pktText(`ACK ${sha}\n`));
+            parts.push(pktText('ready\n'));
+          } else {
+            parts.push(pktText('NAK\n'));
+          }
+          parts.push(PKT_FLUSH);
         }
+        if (shallow.length || unshallow.length) {
+          parts.push(pktText('shallow-info\n'));
+          for (const sha of shallow) parts.push(pktText(`shallow ${sha}\n`));
+          for (const sha of unshallow) parts.push(pktText(`unshallow ${sha}\n`));
+          parts.push(PKT_FLUSH);
+        }
+        parts.push(pktText('packfile\n'));
+        for (const chunk of sidebandChunks(pack, 1)) parts.push(chunk);
         parts.push(PKT_FLUSH);
-      }
-      if (shallow.length || unshallow.length) {
-        parts.push(pktText('shallow-info\n'));
-        for (const sha of shallow) parts.push(pktText(`shallow ${sha}\n`));
-        for (const sha of unshallow) parts.push(pktText(`unshallow ${sha}\n`));
-        parts.push(PKT_FLUSH);
-      }
-      parts.push(pktText('packfile\n'));
-      for (const chunk of sidebandChunks(pack, 1)) parts.push(chunk);
-      parts.push(PKT_FLUSH);
+        return Buffer.concat(parts);
+      });
       res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result' });
-      res.end(Buffer.concat(parts));
+      res.end(reply);
       return;
     }
     res.writeHead(400, { 'content-type': 'text/plain' });
@@ -904,15 +950,18 @@ function gitUploadPack(req, res, repo, body) {
   }
   // Protocol v0: wants section, flush, haves/done section.
   const request = parseFetchArgs(lines);
-  const { pack, shallow, unshallow } = fetchPack(repo, request.wants, request.haves, request.shallow, request.depth);
-  const parts = [];
-  for (const sha of shallow) parts.push(pktText(`shallow ${sha}\n`));
-  for (const sha of unshallow) parts.push(pktText(`unshallow ${sha}\n`));
-  parts.push(pktText('NAK\n'));
-  for (const chunk of sidebandChunks(pack, 1)) parts.push(chunk);
-  parts.push(PKT_FLUSH);
+  const reply = fetchReply(repo, 'v0', request, () => {
+    const { pack, shallow, unshallow } = fetchPack(repo, request.wants, request.haves, request.shallow, request.depth);
+    const parts = [];
+    for (const sha of shallow) parts.push(pktText(`shallow ${sha}\n`));
+    for (const sha of unshallow) parts.push(pktText(`unshallow ${sha}\n`));
+    parts.push(pktText('NAK\n'));
+    for (const chunk of sidebandChunks(pack, 1)) parts.push(chunk);
+    parts.push(PKT_FLUSH);
+    return Buffer.concat(parts);
+  });
   res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result' });
-  res.end(Buffer.concat(parts));
+  res.end(reply);
 }
 function gitReceivePack(req, res, repo, body) {
   if (!repo) {
@@ -967,6 +1016,7 @@ function gitReceivePack(req, res, repo, body) {
       } else {
         if (command.newOid === ZERO) repo.refs.delete(command.ref);
         else repo.refs.set(command.ref, command.newOid);
+        repo.refsVersion += 1;
         reports.push(`ok ${command.ref}\n`);
       }
     }
@@ -984,6 +1034,9 @@ function gitReceivePack(req, res, repo, body) {
 function userJson() {
   return { login: VIEWER.login, id: VIEWER.id, type: 'User', name: VIEWER.name, email: VIEWER.email };
 }
+// The viewer object is identical in every response and is only ever
+// serialized, never mutated, so one shared instance serves all of them.
+const USER_JSON = userJson();
 function repoJson(repo, base) {
   return {
     id: repo.id,
@@ -991,7 +1044,7 @@ function repoJson(repo, base) {
     name: repo.name,
     full_name: `${repo.owner}/${repo.name}`,
     private: repo.private,
-    owner: userJson(),
+    owner: USER_JSON,
     description: repo.description,
     html_url: `${base}/${repo.owner}/${repo.name}`,
     url: `${base}/api/v3/repos/${repo.owner}/${repo.name}`,
@@ -1033,7 +1086,10 @@ function commitFileChange(repo, branch, path, blobSha, message) {
   let tip = branchTip(repo, branch);
   if (!tip) {
     tip = branchTip(repo, repo.defaultBranch);
-    if (tip) repo.refs.set(`refs/heads/${branch}`, tip);
+    if (tip) {
+      repo.refs.set(`refs/heads/${branch}`, tip);
+      repo.refsVersion += 1;
+    }
   }
   const flat = commitTreeFlat(repo, tip);
   if (blobSha === null) flat.delete(path);
@@ -1042,6 +1098,7 @@ function commitFileChange(repo, branch, path, blobSha, message) {
   const parents = tip ? [tip] : [];
   const commit = storeObject(repo, 'commit', buildCommit(tree, parents, message || ''));
   repo.refs.set(`refs/heads/${branch}`, commit);
+  repo.refsVersion += 1;
   return commit;
 }
 function labelJson(label) {
@@ -1059,7 +1116,7 @@ function issueJson(repo, entry, base) {
       const label = repo.labels.get(name);
       return label ? labelJson(label) : { name, color: 'ededed' };
     }),
-    user: userJson(),
+    user: USER_JSON,
     comments: entry.comments.length,
     created_at: NOW_ISO,
     updated_at: NOW_ISO,
@@ -1073,7 +1130,7 @@ function commentJson(comment) {
     id: comment.id,
     node_id: globalId('IssueComment', comment.id),
     body: comment.body,
-    user: userJson(),
+    user: USER_JSON,
     created_at: NOW_ISO,
     updated_at: NOW_ISO,
   };
@@ -1091,7 +1148,7 @@ function pullJson(repo, entry, base) {
     merged: entry.pull.merged,
     merged_at: entry.pull.merged ? NOW_ISO : null,
     merge_commit_sha: entry.pull.mergeCommitSha || null,
-    user: userJson(),
+    user: USER_JSON,
     head: {
       label: `${repo.owner}:${entry.pull.headRef}`,
       ref: entry.pull.headRef,
@@ -1208,6 +1265,7 @@ function mergeEntry(repo, entry) {
   if (merged.conflict) return { error: 'conflict' };
   const commit = storeObject(repo, 'commit', buildCommit(merged.tree, [merged.baseTip], entry.title));
   repo.refs.set(`refs/heads/${entry.pull.baseRef}`, commit);
+  repo.refsVersion += 1;
   entry.pull.merged = true;
   entry.pull.mergeCommitSha = commit;
   entry.state = 'closed';
@@ -1425,6 +1483,7 @@ function handleRest(req, res, segments, query, body, base) {
       if (!getObject(repo, sha)) return sendError(res, 422, 'Validation Failed: unknown object');
       if (repo.refs.has(ref)) return sendError(res, 422, 'Reference already exists');
       repo.refs.set(ref, sha);
+      repo.refsVersion += 1;
       return sendJson(res, 201, { ref, object: { sha, type: getObject(repo, sha)[0] } });
     }
     if (rest.length >= 3 && method === 'GET') {
@@ -2565,24 +2624,75 @@ function handleMcp(req, res, body, base) {
 
 // ---------------------------------------------------------------------------
 // Router and lifecycle
+const EMPTY_BODY = Buffer.alloc(0);
+// Split a request target into path and query without the WHATWG URL
+// parser: it is one of the most expensive per-request calls in the
+// dispatcher and everything it computed is reproduced here. The query
+// is parsed lazily, only when a handler actually asks for a value, and
+// the segment walk resolves dot segments the way the URL parser did.
+function splitTarget(target) {
+  let rest = target;
+  const scheme = rest.indexOf('://');
+  if (scheme >= 0) {
+    const slash = rest.indexOf('/', scheme + 3);
+    rest = slash >= 0 ? rest.slice(slash) : '/';
+  }
+  let queryString = '';
+  const q = rest.indexOf('?');
+  if (q >= 0) {
+    queryString = rest.slice(q + 1);
+    rest = rest.slice(0, q);
+  }
+  let params = null;
+  const query = {
+    get(name) {
+      if (params === null) params = new URLSearchParams(queryString);
+      return params.get(name);
+    },
+  };
+  return { path: rest === '' ? '/' : rest, query };
+}
+function pathSegments(path) {
+  const out = [];
+  for (const raw of path.replace(/\\/g, '/').split('/')) {
+    if (raw === '') continue;
+    const segment = raw.includes('%') ? decodeURIComponent(raw) : raw;
+    if (segment === '.') continue;
+    if (segment === '..') {
+      out.pop();
+      continue;
+    }
+    out.push(segment);
+  }
+  return out;
+}
+
 const server = http.createServer(async (req, res) => {
   try {
-    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const { path, query } = splitTarget(req.url || '/');
     const base = `http://${req.headers.host || 'localhost'}`;
-    const path = url.pathname;
     if (path === '/healthz') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
       return;
     }
-    const body = await readBody(req);
+    // A request that declares no body is answered without putting the
+    // stream machinery through a read cycle: waiting for its 'end'
+    // event costs a full event-loop turn per request, which is the
+    // read workload's whole budget. Bodies that do exist are read
+    // exactly as before.
+    const lengthHeader = req.headers['content-length'];
+    const hasBody =
+      req.headers['transfer-encoding'] !== undefined ||
+      (lengthHeader !== undefined && lengthHeader !== '0');
+    const body = hasBody ? await readBody(req) : EMPTY_BODY;
     if (!authed(req)) {
       sendError(res, 401, 'Bad credentials');
       return;
     }
-    const segments = path.split('/').filter((segment) => segment !== '').map((segment) => decodeURIComponent(segment));
+    const segments = pathSegments(path);
     if (segments[0] === 'api' && segments[1] === 'v3') {
-      handleRest(req, res, segments.slice(2), url.searchParams, body, base);
+      handleRest(req, res, segments.slice(2), query, body, base);
       return;
     }
     if (path === '/api/graphql') {
@@ -2619,7 +2729,7 @@ const server = http.createServer(async (req, res) => {
       const owner = segments[0];
       const name = segments[1].slice(0, -4);
       const repo = owner === VIEWER.login ? getRepo(owner, name) : null;
-      const service = url.searchParams.get('service');
+      const service = query.get('service');
       if (segments.length === 3 && segments[2] === 'info' && req.method === 'GET') {
         // unreachable: 'info' and 'refs' are two segments; handled below
       }
@@ -2650,6 +2760,10 @@ const server = http.createServer(async (req, res) => {
     }
   }
 });
+// Responses here are small and latency-bound; Nagle's algorithm would
+// hold each one back waiting to coalesce a second write that never
+// comes, so turn it off on every accepted socket.
+server.on('connection', (socket) => socket.setNoDelay(true));
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function registerWithEnv(port) {
